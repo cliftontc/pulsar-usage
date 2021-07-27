@@ -1,80 +1,51 @@
 mod usage_message;
-mod state;
-use serde::{Serialize, Deserialize};
+mod redis_storage;
 use futures::TryStreamExt;
 use pulsar::{
-    message::proto::command_subscribe::SubType, message::Payload, Consumer, DeserializeMessage,
+    message::proto::command_subscribe::SubType, Consumer,
     Pulsar, TokioExecutor,
 };
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread;
 use std::time::Duration;
-use crate::state::State;
 use crate::usage_message::UsageMessage;
-// #[derive(Serialize, Deserialize, Debug)]
-// struct TestData {
-//     timestamp: u64,
-// }
+use crate::redis_storage::RedisStorage;
 
-// impl DeserializeMessage for TestData {
-//     type Output = Result<TestData, serde_json::Error>;
-
-//     fn deserialize_message(payload: &Payload) -> Self::Output {
-//         // println!("{:?}", std::str::from_utf8(&payload.data));
-//         serde_json::from_slice(&payload.data)
-//     }
-// }
-// 1617395244367
 #[tokio::main]
 async fn main() -> Result<(), pulsar::Error> {
-    let v = Arc::new(Mutex::new(Vec::new()));
-    let vc = Arc::clone(&v);
-    tokio::spawn(
-        worker_thread(vc)
-    );
+    // Don't move on until storage connection is established
+    let storage = loop {
+        match RedisStorage::new().await {
+            Ok(storage_engine) => break storage_engine,
+            Err(e) => {
+                log::error!("{}", e);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        }
+    };
 
-    loop {
-        thread::sleep(Duration::from_secs(10));
-        let w = v.lock().unwrap();
-
-        println!("{:?}", w.len());
-        drop(w);
-
-    }
-
-    Ok(())
-}
-async fn worker_thread(v: Arc<Mutex<Vec<UsageMessage>>>) {
     let addr = "pulsar://127.0.0.1:6650";
-    let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await.unwrap();
+    let pulsar: Pulsar<_> = Pulsar::builder(addr, TokioExecutor).build().await?;
 
     let mut consumer: Consumer<UsageMessage, _> = pulsar
         .consumer()
         .with_topic("persistent://public/default/usage-metrics")
+        .with_options(pulsar::consumer::ConsumerOptions { initial_position: Some(1), ..Default::default() })
+        .with_consumer_name("test_consumer")
         .with_subscription_type(SubType::Exclusive)
-        .with_subscription("my-first-subscription")
+        .with_subscription("test_subscription")
         .build()
-        .await.unwrap();
-    // let mut counter = 0usize;
-    loop{
-    while let Some(msg) = consumer.try_next().await.unwrap() {
-        consumer.ack(&msg).await.unwrap();
-        match msg.deserialize() {
-            Ok(data) => {
-                // let mut w = v.write().expect("RwLock poisoned");
-                let mut w = v.lock().unwrap();
-                w.push(data);
+        .await?;
 
-                drop(w);
+    while let Some(msg) = consumer.try_next().await? {
+        consumer.ack(&msg).await?;
+        match msg.deserialize() {
+            Ok(msg) => {
+                storage.save_message(msg).await.map_err(|e| pulsar::Error::Custom(e.to_string()))?;
             },
             Err(e) => {
                 println!("could not deserialize message: {:?}", e);
                 break;
             }
         };
-        // thread::sleep(Duration::from_secs(2));
-        // v.lock().unwrap().push(counter);
-        // counter += 1
     }
-    }
+    Ok(())
 }
